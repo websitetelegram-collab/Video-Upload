@@ -738,7 +738,10 @@ import asyncio
 async def main():
     application = build_app()
     logger.info("Bot started.")
-    await application.run_polling(drop_pending_updates=True)
+    async with application:
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        await asyncio.Event().wait()  # run forever until interrupted
 
 if __name__ == "__main__":
     asyncio.run(main())
