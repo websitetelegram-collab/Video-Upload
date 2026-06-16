@@ -734,10 +734,26 @@ def build_app() -> Application:
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 import asyncio
+import os
+from aiohttp import web
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check server running on port {port}")
 
 async def main():
     application = build_app()
     logger.info("Bot started.")
+    await run_http_server()
     async with application:
         await application.start()
         await application.updater.start_polling(drop_pending_updates=True)
