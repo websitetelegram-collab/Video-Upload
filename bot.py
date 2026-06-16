@@ -750,15 +750,43 @@ async def run_http_server():
     await site.start()
     logger.info(f"Health check server running on port {port}")
 
+async def manual_polling(application):
+    """Manually fetch and process updates to avoid PTB event loop conflicts."""
+    bot = application.bot
+    offset = None
+
+    # Drop pending updates on first run
+    updates = await bot.get_updates(offset=-1, timeout=1)
+    if updates:
+        offset = updates[-1].update_id + 1
+
+    logger.info("Polling started, waiting for updates...")
+
+    while True:
+        try:
+            updates = await bot.get_updates(
+                offset=offset,
+                timeout=30,
+                allowed_updates=["message", "callback_query", "chat_member"],
+            )
+            for update in updates:
+                offset = update.update_id + 1
+                await application.process_update(update)
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            await asyncio.sleep(3)
+
 async def main():
     application = build_app()
     logger.info("Bot started.")
     await run_http_server()
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    logger.info("Polling started.")
-    await asyncio.Event().wait()  # run forever until interrupted
+    try:
+        await manual_polling(application)
+    finally:
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
