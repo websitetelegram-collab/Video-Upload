@@ -733,10 +733,12 @@ def build_app() -> Application:
     return app
 
 # ─── Main ────────────────────────────────────────────────────────────────────
-def main():
+import asyncio
+
+async def main():
     application = build_app()
     logger.info("Bot started.")
-    application.run_polling(drop_pending_updates=True)
+    await application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
