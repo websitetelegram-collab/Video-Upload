@@ -634,8 +634,137 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_maintenance(update, ctx)
     elif data == "adm:back":
         await show_admin_menu(update)
+    elif data == "adm:upload":
+        await q.edit_message_text("📤 Send me the video file to upload.")
+        ctx.user_data["state"] = AWAIT_VIDEO
+    elif data == "adm:delete":
+        await q.edit_message_text("🗑 Send the video *code* to delete:", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data["state"] = AWAIT_DELETE_CODE
+    elif data == "adm:edit_title":
+        await q.edit_message_text("✏️ Send the video *code* to edit title:", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data["state"] = AWAIT_EDIT_CODE
+    elif data == "adm:gen_link":
+        await q.edit_message_text("🔗 Send the video *code* to get link:", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data["state"] = "gen_link"
+    elif data == "adm:regen_link":
+        await q.edit_message_text("🔄 Send the video *code* to regenerate link:", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data["state"] = "regen_link"
     else:
-        await q.edit_message_text("Please use the menu commands. Type /menu")
+        await show_admin_menu(update)
+
+# ─── Universal Message Handler (for button-triggered states) ──────────────────
+async def universal_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+    state = ctx.user_data.get("state")
+    msg = update.message
+
+    # Direct video upload (no state needed)
+    if msg.video and not state:
+        ctx.user_data["upload_file_id"] = msg.video.file_id
+        ctx.user_data["upload_file_size"] = msg.video.file_size
+        ctx.user_data["upload_duration"] = msg.video.duration
+        ctx.user_data["state"] = AWAIT_TITLE
+        await msg.reply_text("✅ Video received!\n\nNow send a *title* for this video:", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if state == AWAIT_VIDEO:
+        if msg.video:
+            ctx.user_data["upload_file_id"] = msg.video.file_id
+            ctx.user_data["upload_file_size"] = msg.video.file_size
+            ctx.user_data["upload_duration"] = msg.video.duration
+            ctx.user_data["state"] = AWAIT_TITLE
+            await msg.reply_text("✅ Video received!\n\nNow send a *title* for this video:", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await msg.reply_text("❌ Please send a video file.")
+
+    elif state == AWAIT_TITLE:
+        if not msg.text:
+            await msg.reply_text("❌ Please send a text title.")
+            return
+        title = msg.text.strip()
+        if not title or len(title) > 200:
+            await msg.reply_text("❌ Title must be 1-200 characters.")
+            return
+        file_id = ctx.user_data.pop("upload_file_id")
+        code = generate_code()
+        while db.collection(COL_VIDEOS).where("code", "==", code).limit(1).get():
+            code = generate_code()
+        bot_info = await ctx.bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start={code}"
+        db.collection(COL_VIDEOS).add({
+            "code": code,
+            "file_id": file_id,
+            "title": title,
+            "link": link,
+            "active": True,
+            "uploaded_by": uid,
+            "uploaded_at": SERVER_TIMESTAMP,
+            "views_total": 0,
+            "views_daily": {},
+            "views_weekly": {},
+            "views_monthly": {},
+            "file_size": ctx.user_data.pop("upload_file_size", 0),
+            "duration": ctx.user_data.pop("upload_duration", 0),
+        })
+        ctx.user_data.pop("state", None)
+        await msg.reply_text(
+            f"✅ *Video Uploaded!*\n\n"
+            f"📌 Title: `{title}`\n"
+            f"🔑 Code: `{code}`\n"
+            f"🔗 Link:\n`{link}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif state == AWAIT_DELETE_CODE:
+        code = msg.text.strip() if msg.text else ""
+        docs = db.collection(COL_VIDEOS).where("code", "==", code).limit(1).get()
+        if not docs:
+            await msg.reply_text("❌ Video not found.")
+        else:
+            db.collection(COL_VIDEOS).document(docs[0].id).update({"active": False})
+            await msg.reply_text(f"✅ Video `{code}` deleted.", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data.pop("state", None)
+
+    elif state == AWAIT_EDIT_CODE:
+        ctx.user_data["edit_code"] = msg.text.strip() if msg.text else ""
+        ctx.user_data["state"] = AWAIT_EDIT_TITLE
+        await msg.reply_text("✏️ Now send the new *title*:", parse_mode=ParseMode.MARKDOWN)
+
+    elif state == AWAIT_EDIT_TITLE:
+        code = ctx.user_data.pop("edit_code", "")
+        title = msg.text.strip() if msg.text else ""
+        docs = db.collection(COL_VIDEOS).where("code", "==", code).limit(1).get()
+        if not docs:
+            await msg.reply_text("❌ Video not found.")
+        else:
+            db.collection(COL_VIDEOS).document(docs[0].id).update({"title": title})
+            await msg.reply_text(f"✅ Title updated to `{title}`", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data.pop("state", None)
+
+    elif state == "gen_link":
+        code = msg.text.strip() if msg.text else ""
+        docs = db.collection(COL_VIDEOS).where("code", "==", code).limit(1).get()
+        if not docs:
+            await msg.reply_text("❌ Video not found.")
+        else:
+            video = docs[0].to_dict()
+            await msg.reply_text(f"🔗 Link:\n`{video.get('link', '')}`", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data.pop("state", None)
+
+    elif state == "regen_link":
+        code = msg.text.strip() if msg.text else ""
+        docs = db.collection(COL_VIDEOS).where("code", "==", code).limit(1).get()
+        if not docs:
+            await msg.reply_text("❌ Video not found.")
+        else:
+            new_code = generate_code()
+            bot_info = await ctx.bot.get_me()
+            new_link = f"https://t.me/{bot_info.username}?start={new_code}"
+            db.collection(COL_VIDEOS).document(docs[0].id).update({"code": new_code, "link": new_link})
+            await msg.reply_text(f"🔄 New link:\n`{new_link}`", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data.pop("state", None)
 
 # ─── Cancel ───────────────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -729,6 +858,10 @@ def build_app() -> Application:
     app.add_handler(unblock_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(
+        filters.VIDEO | (filters.TEXT & ~filters.COMMAND),
+        universal_message_handler
+    ))
 
     return app
 
