@@ -39,8 +39,7 @@ logger = logging.getLogger(__name__)
 # ─── Environment ─────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
-FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "")   # e.g. @mychannel
-HEALTH_PORT = int(os.environ.get("PORT", 8080))
+FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "")
 
 # ─── Firebase Init ───────────────────────────────────────────────────────────
 _sa_json = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
@@ -72,8 +71,8 @@ COL_BROADCAST  = "broadcastLogs"
 
 # ─── Rate Limiting ───────────────────────────────────────────────────────────
 _rate_cache: dict[int, list[float]] = {}
-RATE_LIMIT = 10        # max requests
-RATE_WINDOW = 60       # per 60 seconds
+RATE_LIMIT = 10
+RATE_WINDOW = 60
 
 def rate_limited(user_id: int) -> bool:
     now = time.time()
@@ -155,7 +154,7 @@ async def check_force_join(user_id: int, bot) -> bool:
         member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
         return member.status not in ("left", "kicked")
     except Exception:
-        return True  # fail open if channel lookup fails
+        return True
 
 async def record_view(video_id: str, user_id: int):
     today = ts_today()
@@ -163,7 +162,6 @@ async def record_view(video_id: str, user_id: int):
     month = ts_month()
     batch = db.batch()
 
-    # per-video view log
     view_ref = db.collection(COL_VIEWS).document()
     batch.set(view_ref, {
         "video_id": video_id,
@@ -174,7 +172,6 @@ async def record_view(video_id: str, user_id: int):
         "ts": SERVER_TIMESTAMP,
     })
 
-    # increment video counters
     vid_ref = db.collection(COL_VIDEOS).document(video_id)
     batch.update(vid_ref, {
         "views_total": firestore.Increment(1),
@@ -183,7 +180,6 @@ async def record_view(video_id: str, user_id: int):
         f"views_monthly.{month}": firestore.Increment(1),
     })
 
-    # global analytics
     ana_ref = db.collection(COL_ANALYTICS).document("global")
     batch.set(ana_ref, {
         "views_total": firestore.Increment(1),
@@ -192,7 +188,6 @@ async def record_view(video_id: str, user_id: int):
         f"views_monthly.{month}": firestore.Increment(1),
     }, merge=True)
 
-    # user view count
     user_ref = db.collection(COL_USERS).document(str(user_id))
     batch.update(user_ref, {"total_views": firestore.Increment(1), "last_seen": SERVER_TIMESTAMP})
 
@@ -206,11 +201,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     args = ctx.args
     if args:
-        video_code = args[0]
-        await handle_video_request(update, ctx, video_code)
+        await handle_video_request(update, ctx, args[0])
         return
 
-    # maintenance check
     if await is_maintenance() and user.id not in ADMIN_IDS:
         await update.message.reply_text("🔧 Bot is under maintenance. Please check back later.")
         return
@@ -218,9 +211,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.id in ADMIN_IDS:
         await show_admin_menu(update)
     else:
-        await update.message.reply_text(
-            "👋 Welcome!\n\nSend me a video link to watch your content."
-        )
+        await update.message.reply_text("👋 Welcome!\n\nSend me a video link to watch your content.")
 
 async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, code: str):
     user = update.effective_user
@@ -229,13 +220,11 @@ async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, c
         await update.message.reply_text("🔧 Bot is under maintenance.")
         return
 
-    # check blocked
     u_doc = db.collection(COL_USERS).document(str(user.id)).get()
     if u_doc.exists and u_doc.to_dict().get("blocked"):
         await update.message.reply_text("⛔ You have been blocked from using this bot.")
         return
 
-    # force join
     if not await check_force_join(user.id, ctx.bot):
         kb = [[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL.lstrip('@')}")]]
         await update.message.reply_text(
@@ -244,7 +233,6 @@ async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, c
         )
         return
 
-    # find video by code
     docs = db.collection(COL_VIDEOS).where("code", "==", code).where("active", "==", True).limit(1).get()
     if not docs:
         await update.message.reply_text("❌ Video not found or link has expired.")
@@ -252,7 +240,6 @@ async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, c
 
     video_doc = docs[0]
     video = video_doc.to_dict()
-    video_id = video_doc.id
 
     try:
         await ctx.bot.send_video(
@@ -262,7 +249,7 @@ async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, c
             parse_mode=ParseMode.MARKDOWN,
             protect_content=True,
         )
-        await record_view(video_id, user.id)
+        await record_view(video_doc.id, user.id)
     except TelegramError as e:
         logger.error(f"send_video error: {e}")
         await update.message.reply_text("❌ Failed to send video. Please try again.")
@@ -282,18 +269,16 @@ async def show_admin_menu(update: Update):
          InlineKeyboardButton("📋 List Videos", callback_data="adm:list_videos")],
     ]
     text = "🛠 *Admin Panel*\n\nChoose an action:"
-    msg = update.message or (update.callback_query and update.callback_query.message)
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
     else:
-        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-# ─── Admin /menu ─────────────────────────────────────────────────────────────
 @admin_only
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_admin_menu(update)
 
-# ─── Upload Conversation ──────────────────────────────────────────────────────
+# ─── Upload ───────────────────────────────────────────────────────────────────
 @admin_only
 async def upload_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📤 Send me the video file to upload.")
@@ -317,8 +302,6 @@ async def upload_receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     file_id = ctx.user_data.pop("upload_file_id")
     code = generate_code()
-
-    # ensure unique
     while db.collection(COL_VIDEOS).where("code", "==", code).limit(1).get():
         code = generate_code()
 
@@ -350,7 +333,7 @@ async def upload_receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ─── Delete Video ─────────────────────────────────────────────────────────────
+# ─── Delete ───────────────────────────────────────────────────────────────────
 @admin_only
 async def delete_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Send the video *code* to delete:", parse_mode=ParseMode.MARKDOWN)
@@ -362,8 +345,7 @@ async def delete_receive_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not docs:
         await update.message.reply_text("❌ Video not found.")
         return ConversationHandler.END
-    doc = docs[0]
-    doc.reference.update({"active": False})
+    docs[0].reference.update({"active": False})
     await update.message.reply_text(f"✅ Video `{code}` has been deactivated.", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
@@ -379,7 +361,6 @@ async def edit_title_receive_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not docs:
         await update.message.reply_text("❌ Video not found.")
         return ConversationHandler.END
-    ctx.user_data["edit_video_code"] = code
     ctx.user_data["edit_video_ref"] = docs[0].reference
     await update.message.reply_text("✏️ Send the new title:")
     return AWAIT_EDIT_TITLE
@@ -389,12 +370,11 @@ async def edit_title_receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYP
     if not new_title or len(new_title) > 200:
         await update.message.reply_text("❌ Title must be 1-200 characters.")
         return AWAIT_EDIT_TITLE
-    ref = ctx.user_data.pop("edit_video_ref")
-    ref.update({"title": new_title})
+    ctx.user_data.pop("edit_video_ref").update({"title": new_title})
     await update.message.reply_text(f"✅ Title updated to: `{new_title}`", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
-# ─── Generate / Regenerate Link ───────────────────────────────────────────────
+# ─── Get Link ─────────────────────────────────────────────────────────────────
 @admin_only
 async def gen_link_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔗 Send the video *code* to get its link:", parse_mode=ParseMode.MARKDOWN)
@@ -413,6 +393,7 @@ async def gen_link_receive_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# ─── Regen Link ───────────────────────────────────────────────────────────────
 @admin_only
 async def regen_link_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Send the video *code* to regenerate its link:", parse_mode=ParseMode.MARKDOWN)
@@ -424,20 +405,19 @@ async def regen_link_receive_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not docs:
         await update.message.reply_text("❌ Video not found.")
         return ConversationHandler.END
-    doc = docs[0]
     new_code = generate_code()
     while db.collection(COL_VIDEOS).where("code", "==", new_code).limit(1).get():
         new_code = generate_code()
     bot_info = await ctx.bot.get_me()
     new_link = f"https://t.me/{bot_info.username}?start={new_code}"
-    doc.reference.update({"code": new_code, "link": new_link})
+    docs[0].reference.update({"code": new_code, "link": new_link})
     await update.message.reply_text(
         f"✅ Link regenerated!\n\n🔑 New Code: `{new_code}`\n🔗 New Link:\n`{new_link}`",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
 
-# ─── User Management ──────────────────────────────────────────────────────────
+# ─── Block / Unblock ──────────────────────────────────────────────────────────
 @admin_only
 async def block_user_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛔ Send the user ID to *block*:", parse_mode=ParseMode.MARKDOWN)
@@ -471,9 +451,9 @@ async def unblock_user_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Analytics ────────────────────────────────────────────────────────────────
 @admin_only
 async def cmd_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    today  = ts_today()
-    week   = ts_week()
-    month  = ts_month()
+    today = ts_today()
+    week  = ts_week()
+    month = ts_month()
 
     ana_doc = db.collection(COL_ANALYTICS).document("global").get()
     ana = ana_doc.to_dict() if ana_doc.exists else {}
@@ -483,23 +463,21 @@ async def cmd_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     weekly_views  = ana.get("views_weekly", {}).get(week, 0)
     monthly_views = ana.get("views_monthly", {}).get(month, 0)
 
-    # user counts
-    all_users   = db.collection(COL_USERS).get()
-    total_users = len(all_users)
-    blocked     = sum(1 for u in all_users if u.to_dict().get("blocked"))
+    all_users    = db.collection(COL_USERS).get()
+    total_users  = len(all_users)
+    blocked      = sum(1 for u in all_users if u.to_dict().get("blocked"))
 
-    # video count
-    videos = db.collection(COL_VIDEOS).where("active", "==", True).get()
+    videos       = db.collection(COL_VIDEOS).where("active", "==", True).get()
     total_videos = len(videos)
 
-    # top 5 most viewed
     top = sorted(videos, key=lambda d: d.to_dict().get("views_total", 0), reverse=True)[:5]
     top_text = ""
     for i, v in enumerate(top, 1):
         vd = v.to_dict()
         top_text += f"\n  {i}. {vd.get('title','?')} — {vd.get('views_total',0)} views"
 
-    await (update.message or update.callback_query.message).reply_text(
+    msg = update.message or update.callback_query.message
+    await msg.reply_text(
         f"📊 *Analytics*\n\n"
         f"👁 Views Today: `{daily_views}`\n"
         f"👁 Views This Week: `{weekly_views}`\n"
@@ -515,15 +493,16 @@ async def cmd_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     all_users = db.collection(COL_USERS).get()
-    total = len(all_users)
+    total   = len(all_users)
     blocked = sum(1 for u in all_users if u.to_dict().get("blocked"))
-    # "active" = seen in last 7 days
     week_ago = now_utc() - timedelta(days=7)
-    active = sum(1 for u in all_users if u.to_dict().get("last_seen") and
-                 u.to_dict()["last_seen"].replace(tzinfo=timezone.utc) > week_ago
-                 if hasattr(u.to_dict().get("last_seen", ""), "replace"))
-
-    await (update.message or update.callback_query.message).reply_text(
+    active = sum(
+        1 for u in all_users
+        if hasattr(u.to_dict().get("last_seen", ""), "replace") and
+        u.to_dict()["last_seen"].replace(tzinfo=timezone.utc) > week_ago
+    )
+    msg = update.message or update.callback_query.message
+    await msg.reply_text(
         f"👥 *User Statistics*\n\n"
         f"Total: `{total}`\n"
         f"Active (7d): `{active}`\n"
@@ -531,43 +510,34 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-# ─── List Videos ─────────────────────────────────────────────────────────────
 @admin_only
 async def cmd_list_videos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    videos = db.collection(COL_VIDEOS).where("active", "==", True).order_by("uploaded_at", direction=firestore.Query.DESCENDING).limit(20).get()
+    videos = db.collection(COL_VIDEOS).where("active", "==", True).order_by(
+        "uploaded_at", direction=firestore.Query.DESCENDING).limit(20).get()
+    msg = update.message or update.callback_query.message
     if not videos:
-        await (update.message or update.callback_query.message).reply_text("📭 No active videos.")
+        await msg.reply_text("📭 No active videos.")
         return
-
     lines = ["📋 *Recent Videos (latest 20)*\n"]
     for v in videos:
         vd = v.to_dict()
         lines.append(f"• `{vd['code']}` — {vd.get('title','?')} ({vd.get('views_total',0)} views)")
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-    await (update.message or update.callback_query.message).reply_text(
-        "\n".join(lines), parse_mode=ParseMode.MARKDOWN
-    )
-
-# ─── Maintenance Toggle ───────────────────────────────────────────────────────
 @admin_only
 async def cmd_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current = await get_setting("maintenance", False)
     new_val = not current
     await set_setting("maintenance", new_val)
     state = "🔧 ON" if new_val else "✅ OFF"
-    await (update.message or update.callback_query.message).reply_text(
-        f"Maintenance mode is now *{state}*.", parse_mode=ParseMode.MARKDOWN
-    )
+    msg = update.message or update.callback_query.message
+    await msg.reply_text(f"Maintenance mode is now *{state}*.", parse_mode=ParseMode.MARKDOWN)
 
 # ─── Broadcast ───────────────────────────────────────────────────────────────
-# Store pending broadcast in bot_data keyed by admin id
 @admin_only
 async def broadcast_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📢 *Broadcast*\n\nSend me the content to broadcast.\n"
-        "Supports: text, photo, video.\n"
-        "You can also include inline buttons by sending text in format:\n"
-        "`Message text\n[Button Label](https://url)`",
+        "📢 *Broadcast*\n\nSend me the content to broadcast.\nSupports: text, photo, video.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return AWAIT_BROADCAST_CONTENT
@@ -575,7 +545,6 @@ async def broadcast_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def broadcast_receive_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["bc_message_id"] = update.message.message_id
     ctx.user_data["bc_chat_id"] = update.message.chat_id
-
     user_count = len(db.collection(COL_USERS).where("blocked", "==", False).get())
     kb = [[
         InlineKeyboardButton("✅ Send Now", callback_data="bc:confirm"),
@@ -597,10 +566,8 @@ async def broadcast_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Broadcast cancelled.")
         return ConversationHandler.END
 
-    # confirm
     src_chat = ctx.user_data.pop("bc_chat_id")
     src_msg  = ctx.user_data.pop("bc_message_id")
-
     users = db.collection(COL_USERS).where("blocked", "==", False).get()
     total = len(users)
     sent = failed = blocked_count = deactivated = 0
@@ -611,12 +578,7 @@ async def broadcast_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for i, u_doc in enumerate(users):
         uid = int(u_doc.id)
         try:
-            await ctx.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=src_chat,
-                message_id=src_msg,
-                protect_content=False,
-            )
+            await ctx.bot.copy_message(chat_id=uid, from_chat_id=src_chat, message_id=src_msg)
             sent += 1
         except Forbidden:
             blocked_count += 1
@@ -632,35 +594,23 @@ async def broadcast_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if (i + 1) % 50 == 0:
             try:
                 await progress_msg.edit_text(
-                    f"📢 Broadcasting... {i+1}/{total}\n"
-                    f"✅ Sent: {sent} | ❌ Failed: {failed}"
+                    f"📢 Broadcasting... {i+1}/{total}\n✅ Sent: {sent} | ❌ Failed: {failed}"
                 )
             except Exception:
                 pass
-        await asyncio.sleep(0.05)  # ~20 msg/s
+        await asyncio.sleep(0.05)
 
     elapsed = round(time.time() - start_time)
-
-    # log
     db.collection(COL_BROADCAST).add({
-        "sent": sent,
-        "failed": failed,
-        "blocked": blocked_count,
-        "deactivated": deactivated,
-        "total": total,
-        "by": update.effective_user.id,
-        "ts": SERVER_TIMESTAMP,
-        "elapsed_sec": elapsed,
+        "sent": sent, "failed": failed, "blocked": blocked_count,
+        "deactivated": deactivated, "total": total,
+        "by": update.effective_user.id, "ts": SERVER_TIMESTAMP, "elapsed_sec": elapsed,
     })
-
     await progress_msg.edit_text(
         f"📢 *Broadcast Complete!*\n\n"
-        f"👥 Total: `{total}`\n"
-        f"✅ Sent: `{sent}`\n"
-        f"🚫 Blocked: `{blocked_count}`\n"
-        f"💤 Deactivated: `{deactivated}`\n"
-        f"❌ Failed: `{failed}`\n"
-        f"⏱ Time: `{elapsed}s`",
+        f"👥 Total: `{total}`\n✅ Sent: `{sent}`\n"
+        f"🚫 Blocked: `{blocked_count}`\n💤 Deactivated: `{deactivated}`\n"
+        f"❌ Failed: `{failed}`\n⏱ Time: `{elapsed}s`",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
@@ -669,17 +619,11 @@ async def broadcast_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data
-
-    # fake update.message for admin_only decorator compatibility
-    if not hasattr(update, '_patched'):
-        update._patched = True
-
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
         await q.answer("⛔ Admins only.", show_alert=True)
         return
-
+    data = q.data
     if data == "adm:analytics":
         await cmd_analytics(update, ctx)
     elif data == "adm:users":
@@ -690,7 +634,6 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_maintenance(update, ctx)
     elif data == "adm:back":
         await show_admin_menu(update)
-    # upload/delete/etc handled by ConversationHandlers via commands
     else:
         await q.edit_message_text("Please use the menu commands. Type /menu")
 
@@ -700,27 +643,11 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Operation cancelled.")
     return ConversationHandler.END
 
-# ─── Health Check ─────────────────────────────────────────────────────────────
-async def health_server():
-    from aiohttp import web
-    async def handler(request):
-        return web.Response(text="OK")
-    app = web.Application()
-    app.router.add_get("/", handler)
-    app.router.add_get("/health", handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
-    await site.start()
-    logger.info(f"Health check server on port {HEALTH_PORT}")
-
 # ─── Build App ────────────────────────────────────────────────────────────────
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-
     cancel_handler = CommandHandler("cancel", cmd_cancel)
 
-    # Upload conversation
     upload_conv = ConversationHandler(
         entry_points=[CommandHandler("upload", upload_start)],
         states={
@@ -729,8 +656,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Delete conversation
     delete_conv = ConversationHandler(
         entry_points=[CommandHandler("delete", delete_start)],
         states={
@@ -738,8 +663,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Edit title conversation
     edit_title_conv = ConversationHandler(
         entry_points=[CommandHandler("edittitle", edit_title_start)],
         states={
@@ -748,8 +671,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Gen link conversation
     gen_link_conv = ConversationHandler(
         entry_points=[CommandHandler("getlink", gen_link_start)],
         states={
@@ -757,8 +678,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Regen link conversation
     regen_link_conv = ConversationHandler(
         entry_points=[CommandHandler("regenlink", regen_link_start)],
         states={
@@ -766,8 +685,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Block user conversation
     block_conv = ConversationHandler(
         entry_points=[CommandHandler("block", block_user_start)],
         states={
@@ -775,8 +692,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Unblock user conversation
     unblock_conv = ConversationHandler(
         entry_points=[CommandHandler("unblock", unblock_user_start)],
         states={
@@ -784,8 +699,6 @@ def build_app() -> Application:
         },
         fallbacks=[cancel_handler],
     )
-
-    # Broadcast conversation
     broadcast_conv = ConversationHandler(
         entry_points=[CommandHandler("broadcast", broadcast_start)],
         states={
@@ -820,31 +733,10 @@ def build_app() -> Application:
     return app
 
 # ─── Main ────────────────────────────────────────────────────────────────────
-async def main():
-    await health_server()
+def main():
     application = build_app()
-
-    # Set bot commands
-    await application.bot.set_my_commands([
-        BotCommand("start",       "Start the bot"),
-        BotCommand("menu",        "Admin menu"),
-        BotCommand("upload",      "Upload a video [admin]"),
-        BotCommand("delete",      "Delete a video [admin]"),
-        BotCommand("edittitle",   "Edit video title [admin]"),
-        BotCommand("getlink",     "Get video link [admin]"),
-        BotCommand("regenlink",   "Regenerate video link [admin]"),
-        BotCommand("block",       "Block a user [admin]"),
-        BotCommand("unblock",     "Unblock a user [admin]"),
-        BotCommand("broadcast",   "Send broadcast [admin]"),
-        BotCommand("analytics",   "View analytics [admin]"),
-        BotCommand("users",       "User statistics [admin]"),
-        BotCommand("videos",      "List videos [admin]"),
-        BotCommand("maintenance", "Toggle maintenance [admin]"),
-        BotCommand("cancel",      "Cancel current operation"),
-    ])
-
     logger.info("Bot started.")
-    await application.run_polling(drop_pending_updates=True)
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
