@@ -49,13 +49,12 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 # ─── Firestore Collections ───────────────────────────────────────────────────
-COL_USERS        = "users"
-COL_VIDEOS       = "videos"
-COL_VIEWS        = "views"
-COL_SETTINGS     = "settings"
-COL_ANALYTICS    = "analytics"
-COL_BROADCAST    = "broadcastLogs"
-COL_COLLECTIONS  = "collections"   # NEW: Multi-file collections
+COL_USERS      = "users"
+COL_VIDEOS     = "videos"
+COL_VIEWS      = "views"
+COL_SETTINGS   = "settings"
+COL_ANALYTICS  = "analytics"
+COL_BROADCAST  = "broadcastLogs"
 
 # ─── Conversation States ─────────────────────────────────────────────────────
 (
@@ -68,16 +67,7 @@ COL_COLLECTIONS  = "collections"   # NEW: Multi-file collections
     AWAIT_UNBLOCK_ID,
     AWAIT_BROADCAST_CONTENT,
     AWAIT_BROADCAST_CONFIRM,
-    # NEW states
-    AWAIT_FORCE_JOIN_CHANNEL,
-    AWAIT_COLLECTION_FILES,
-    AWAIT_COLLECTION_TITLE,
-    AWAIT_COL_MANAGE_CODE,
-    AWAIT_COL_EDIT_CODE,
-    AWAIT_COL_EDIT_TITLE,
-    AWAIT_COL_DELETE_CODE,
-    AWAIT_COL_REGEN_CODE,
-) = range(17)
+) = range(9)
 
 # ─── Rate Limiting ───────────────────────────────────────────────────────────
 _rate_cache: dict[int, list[float]] = {}
@@ -157,29 +147,11 @@ async def upsert_user(user):
         data["total_views"] = 0
     ref.set(data, merge=True)
 
-async def get_force_join_channel() -> str:
-    """Get force join channel from Firestore (dynamic), fallback to env var."""
-    db_channel = await get_setting("force_join_channel", "")
-    if db_channel:
-        return db_channel
-    return FORCE_JOIN_CHANNEL
-
-async def is_force_join_enabled() -> bool:
-    """Check if force join is enabled from Firestore."""
-    enabled = await get_setting("force_join_enabled", None)
-    if enabled is None:
-        # Default: enabled if env var is set
-        return bool(FORCE_JOIN_CHANNEL)
-    return bool(enabled)
-
 async def check_force_join(user_id: int, bot) -> bool:
-    if not await is_force_join_enabled():
-        return True
-    channel = await get_force_join_channel()
-    if not channel:
+    if not FORCE_JOIN_CHANNEL:
         return True
     try:
-        member = await bot.get_chat_member(channel, user_id)
+        member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
         return member.status not in ("left", "kicked")
     except Exception:
         return True
@@ -254,18 +226,11 @@ async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, c
         return
 
     if not await check_force_join(user.id, ctx.bot):
-        channel = await get_force_join_channel()
-        kb = [[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel.lstrip('@')}")]]
+        kb = [[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL.lstrip('@')}")]]
         await update.message.reply_text(
             "⚠️ You must join our channel to watch videos.",
             reply_markup=InlineKeyboardMarkup(kb),
         )
-        return
-
-    # Check if this is a collection code
-    col_docs = db.collection(COL_COLLECTIONS).where("code", "==", code).where("active", "==", True).limit(1).get()
-    if col_docs:
-        await handle_collection_request(update, ctx, col_docs[0])
         return
 
     docs = db.collection(COL_VIDEOS).where("code", "==", code).where("active", "==", True).limit(1).get()
@@ -289,120 +254,63 @@ async def handle_video_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, c
         logger.error(f"send_video error: {e}")
         await update.message.reply_text("❌ Failed to send video. Please try again.")
 
-async def handle_collection_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, col_doc):
-    """Send all files in a collection to the user sequentially."""
-    col = col_doc.to_dict()
-    files = col.get("files", [])
-    title = col.get("title", "Collection")
-
-    await update.message.reply_text(
-        f"📦 *{title}*\n\n📁 {len(files)} file(s) — sending now...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    today = ts_today()
-    week  = ts_week()
-    month = ts_month()
-
-    for idx, f in enumerate(files, 1):
-        ftype    = f.get("type", "video")
-        file_id  = f.get("file_id", "")
-        fname    = f.get("name", f"File {idx}")
-        caption  = f"📎 *{fname}* ({idx}/{len(files)})"
-        try:
-            if ftype == "video":
-                await ctx.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    protect_content=True,
-                )
-            elif ftype == "document":
-                await ctx.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    protect_content=True,
-                )
-            elif ftype == "photo":
-                await ctx.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    protect_content=True,
-                )
-            elif ftype == "audio":
-                await ctx.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    protect_content=True,
-                )
-            else:
-                await ctx.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    protect_content=True,
-                )
-        except TelegramError as e:
-            logger.error(f"Collection send error file {idx}: {e}")
-        await asyncio.sleep(0.3)
-
-    # Record collection view
-    user_id = update.effective_user.id
-    batch = db.batch()
-    col_ref = db.collection(COL_COLLECTIONS).document(col_doc.id)
-    batch.update(col_ref, {
-        "views_total": firestore.Increment(1),
-        f"views_daily.{today}": firestore.Increment(1),
-        f"views_weekly.{week}": firestore.Increment(1),
-        f"views_monthly.{month}": firestore.Increment(1),
-    })
-    ana_ref = db.collection(COL_ANALYTICS).document("global")
-    batch.set(ana_ref, {
-        "col_views_total": firestore.Increment(1),
-        f"col_views_daily.{today}": firestore.Increment(1),
-    }, merge=True)
-    user_ref = db.collection(COL_USERS).document(str(user_id))
-    batch.update(user_ref, {"total_views": firestore.Increment(1), "last_seen": SERVER_TIMESTAMP})
-    batch.commit()
-
-    await update.message.reply_text(f"✅ All {len(files)} file(s) from *{title}* sent!", parse_mode=ParseMode.MARKDOWN)
-
 # ─── Admin Menu ───────────────────────────────────────────────────────────────
-async def show_admin_menu(update: Update):
-    kb = [
-        [InlineKeyboardButton("📤 Upload Video", callback_data="adm:upload")],
-        [InlineKeyboardButton("🗑 Delete Video", callback_data="adm:delete"),
-         InlineKeyboardButton("✏️ Edit Title", callback_data="adm:edit_title")],
-        [InlineKeyboardButton("🔗 Generate Link", callback_data="adm:gen_link"),
-         InlineKeyboardButton("🔄 Regen Link", callback_data="adm:regen_link")],
-        [InlineKeyboardButton("👥 Users", callback_data="adm:users"),
-         InlineKeyboardButton("📊 Analytics", callback_data="adm:analytics")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast")],
-        [InlineKeyboardButton("🔧 Maintenance", callback_data="adm:maintenance"),
-         InlineKeyboardButton("📋 List Videos", callback_data="adm:list_videos")],
-        # ── NEW FEATURES ──
-        [InlineKeyboardButton("📡 Force Join Settings", callback_data="adm:force_join_menu")],
-        [InlineKeyboardButton("📦 Create Collection", callback_data="adm:create_collection"),
-         InlineKeyboardButton("🗂 Manage Collections", callback_data="adm:manage_collections")],
-        [InlineKeyboardButton("📈 Collection Analytics", callback_data="adm:col_analytics")],
+def build_admin_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    """Build professional paginated admin panel keyboard."""
+    pages = [
+        # Page 0 – Main Actions
+        [
+            [InlineKeyboardButton("📤 Upload Video", callback_data="adm:upload"),
+             InlineKeyboardButton("🗑 Delete Video", callback_data="adm:delete")],
+            [InlineKeyboardButton("✏️ Edit Title", callback_data="adm:edit_title"),
+             InlineKeyboardButton("🔗 Get Link", callback_data="adm:gen_link")],
+            [InlineKeyboardButton("🔄 Regen Link", callback_data="adm:regen_link"),
+             InlineKeyboardButton("📋 List Videos", callback_data="adm:list_videos")],
+            [InlineKeyboardButton("➡️ More Options »", callback_data="adm:page:1")],
+        ],
+        # Page 1 – Management
+        [
+            [InlineKeyboardButton("👥 User Stats", callback_data="adm:users"),
+             InlineKeyboardButton("📊 Analytics", callback_data="adm:analytics")],
+            [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast"),
+             InlineKeyboardButton("🔧 Maintenance", callback_data="adm:maintenance")],
+            [InlineKeyboardButton("🚫 Block User", callback_data="adm:block"),
+             InlineKeyboardButton("✅ Unblock User", callback_data="adm:unblock")],
+            [InlineKeyboardButton("« Back to Main", callback_data="adm:page:0")],
+        ],
     ]
-    text = "🛠 *Admin Panel*\n\nChoose an action:"
+    page = max(0, min(page, len(pages) - 1))
+    return InlineKeyboardMarkup(pages[page])
+
+async def show_admin_menu(update: Update, page: int = 0):
+    page_labels = ["📌 Main Actions", "⚙️ Management"]
+    text = (
+        f"🛠 *Admin Panel* — {page_labels[page]}\n\n"
+        f"Welcome, Admin! Select an option below:"
+    )
+    kb = build_admin_keyboard(page)
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        await update.callback_query.edit_message_text(
+            text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN
+        )
     else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN
+        )
 
 @admin_only
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_admin_menu(update)
+
+# ─── Unknown Command Handler ──────────────────────────────────────────────────
+async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Block all unknown commands for non-admins; silently ignore for admins."""
+    uid = update.effective_user.id
+    if uid in ADMIN_IDS:
+        # Admin typed a command not handled elsewhere — show panel
+        await show_admin_menu(update)
+        return
+    await update.message.reply_text("❌ Invalid Command.")
 
 # ─── Upload ───────────────────────────────────────────────────────────────────
 @admin_only
@@ -741,327 +649,31 @@ async def broadcast_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ─── Force Join Settings ─────────────────────────────────────────────────────
-async def show_force_join_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    enabled = await is_force_join_enabled()
-    channel = await get_force_join_channel()
-    status  = "✅ ON" if enabled else "❌ OFF"
-    ch_text = f"`{channel}`" if channel else "_Not set_"
-    text = (
-        f"📡 *Force Join Settings*\n\n"
-        f"Status: *{status}*\n"
-        f"Channel: {ch_text}\n\n"
-        f"Choose an action:"
-    )
-    kb = [
-        [InlineKeyboardButton(
-            "❌ Turn OFF" if enabled else "✅ Turn ON",
-            callback_data="fj:toggle"
-        )],
-        [InlineKeyboardButton("✏️ Change Channel", callback_data="fj:set_channel")],
-        [InlineKeyboardButton("🔙 Back", callback_data="adm:back")],
-    ]
-    q = update.callback_query
-    if q:
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-async def fj_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    current = await is_force_join_enabled()
-    await set_setting("force_join_enabled", not current)
-    await show_force_join_menu(update, ctx)
-
-async def fj_set_channel_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["state"] = AWAIT_FORCE_JOIN_CHANNEL
-    await q.edit_message_text(
-        "✏️ Send the new channel username (e.g. `@mychannel`) or send `/cancel` to abort:",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-async def fj_receive_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    channel = update.message.text.strip()
-    if not channel.startswith("@") and not channel.startswith("-"):
-        channel = "@" + channel
-    await set_setting("force_join_channel", channel)
-    # Also enable if a channel is set
-    await set_setting("force_join_enabled", True)
-    ctx.user_data.pop("state", None)
-    await update.message.reply_text(
-        f"✅ Force Join channel updated to `{channel}` and *enabled*.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-# ─── Create Collection ────────────────────────────────────────────────────────
-async def collection_create_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Begin collection creation: reset buffer and prompt for files."""
-    ctx.user_data["col_files"] = []
-    ctx.user_data["state"] = AWAIT_COLLECTION_FILES
-    q = update.callback_query
-    msg = (
-        "📦 *Create Collection*\n\n"
-        "Send me Videos/Files one by one.\n"
-        "Each file will be added to the collection.\n\n"
-        "When done, press *✅ Create Link* button below."
-    )
-    kb = [[InlineKeyboardButton("✅ Create Link", callback_data="col:finalize")]]
-    if q:
-        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-async def collection_receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin sends a file — add to buffer and show count."""
-    msg = update.message
-    col_files: list = ctx.user_data.setdefault("col_files", [])
-
-    file_info = None
-    if msg.video:
-        file_info = {"type": "video",    "file_id": msg.video.file_id,    "name": msg.video.file_name or f"Video {len(col_files)+1}"}
-    elif msg.document:
-        file_info = {"type": "document", "file_id": msg.document.file_id, "name": msg.document.file_name or f"File {len(col_files)+1}"}
-    elif msg.photo:
-        file_info = {"type": "photo",    "file_id": msg.photo[-1].file_id, "name": f"Photo {len(col_files)+1}"}
-    elif msg.audio:
-        file_info = {"type": "audio",    "file_id": msg.audio.file_id,    "name": msg.audio.title or f"Audio {len(col_files)+1}"}
-
-    if not file_info:
-        await msg.reply_text("❌ Please send a Video, Document, Photo, or Audio file.")
-        return
-
-    col_files.append(file_info)
-    count = len(col_files)
-    kb = [[InlineKeyboardButton(f"✅ Create Link ({count} file{'s' if count>1 else ''})", callback_data="col:finalize")]]
-    await msg.reply_text(
-        f"✅ *File {count} added!*\n📌 {file_info['name']}\n\nTotal: *{count}* file(s)\n\nSend more or press *Create Link*.",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-async def collection_finalize_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User pressed 'Create Link' — ask for collection title."""
-    q = update.callback_query
-    await q.answer()
-    col_files = ctx.user_data.get("col_files", [])
-    if not col_files:
-        await q.answer("❌ No files added yet! Send at least one file.", show_alert=True)
-        return
-    ctx.user_data["state"] = AWAIT_COLLECTION_TITLE
-    await q.edit_message_text(
-        f"📝 *{len(col_files)} file(s) ready!*\n\nNow send a *title* for this collection:",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-async def collection_receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive collection title, save to Firestore, generate single link."""
-    title = update.message.text.strip()
-    if not title or len(title) > 200:
-        await update.message.reply_text("❌ Title must be 1–200 characters.")
-        return
-
-    col_files = ctx.user_data.pop("col_files", [])
-    if not col_files:
-        await update.message.reply_text("❌ No files found. Please start over.")
-        ctx.user_data.pop("state", None)
-        return
-
-    code = generate_code()
-    while db.collection(COL_COLLECTIONS).where("code", "==", code).limit(1).get():
-        code = generate_code()
-
-    bot_info = await ctx.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={code}"
-
-    db.collection(COL_COLLECTIONS).add({
-        "code": code,
-        "title": title,
-        "link": link,
-        "files": col_files,
-        "active": True,
-        "uploaded_by": update.effective_user.id,
-        "created_at": SERVER_TIMESTAMP,
-        "views_total": 0,
-        "views_daily": {},
-        "views_weekly": {},
-        "views_monthly": {},
-        "file_count": len(col_files),
-    })
-
-    ctx.user_data.pop("state", None)
-    await update.message.reply_text(
-        f"✅ *Collection Created!*\n\n"
-        f"📌 Title: `{title}`\n"
-        f"📁 Files: `{len(col_files)}`\n"
-        f"🔑 Code: `{code}`\n"
-        f"🔗 Link:\n`{link}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-# ─── Manage Collections ───────────────────────────────────────────────────────
-async def show_manage_collections(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """List all active collections for admin."""
-    cols = (
-        db.collection(COL_COLLECTIONS)
-        .where("active", "==", True)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .limit(20)
-        .get()
-    )
-    q = update.callback_query
-    if not cols:
-        text = "📭 No active collections."
-        kb   = [[InlineKeyboardButton("🔙 Back", callback_data="adm:back")]]
-        if q:
-            await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    lines = ["🗂 *Collections (latest 20)*\n"]
-    for c in cols:
-        cd = c.to_dict()
-        lines.append(
-            f"• `{cd['code']}` — {cd.get('title','?')} "
-            f"({cd.get('file_count', len(cd.get('files',[])))}) files | {cd.get('views_total',0)} views"
-        )
-
-    kb = [
-        [InlineKeyboardButton("✏️ Edit Title", callback_data="col_mgr:edit"),
-         InlineKeyboardButton("🗑 Delete", callback_data="col_mgr:delete")],
-        [InlineKeyboardButton("🔄 Regen Link", callback_data="col_mgr:regen"),
-         InlineKeyboardButton("📈 Analytics", callback_data="adm:col_analytics")],
-        [InlineKeyboardButton("🔙 Back", callback_data="adm:back")],
-    ]
-    text = "\n".join(lines)
-    if q:
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-async def col_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["state"] = AWAIT_COL_EDIT_CODE
-    ctx.user_data["col_action"] = "edit_title"
-    await q.edit_message_text("✏️ Send the collection *code* to edit its title:", parse_mode=ParseMode.MARKDOWN)
-
-async def col_delete_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["state"] = AWAIT_COL_DELETE_CODE
-    ctx.user_data["col_action"] = "delete"
-    await q.edit_message_text("🗑 Send the collection *code* to delete:", parse_mode=ParseMode.MARKDOWN)
-
-async def col_regen_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["state"] = AWAIT_COL_REGEN_CODE
-    ctx.user_data["col_action"] = "regen"
-    await q.edit_message_text("🔄 Send the collection *code* to regenerate its link:", parse_mode=ParseMode.MARKDOWN)
-
-async def col_receive_edit_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    docs = db.collection(COL_COLLECTIONS).where("code", "==", code).limit(1).get()
-    if not docs:
-        await update.message.reply_text("❌ Collection not found.")
-        ctx.user_data.pop("state", None)
-        return
-    ctx.user_data["col_edit_ref"] = docs[0].reference
-    ctx.user_data["state"] = AWAIT_COL_EDIT_TITLE
-    await update.message.reply_text("✏️ Send the new title for this collection:")
-
-async def col_receive_edit_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    title = update.message.text.strip()
-    if not title or len(title) > 200:
-        await update.message.reply_text("❌ Title must be 1–200 characters.")
-        return
-    ref = ctx.user_data.pop("col_edit_ref", None)
-    if ref:
-        ref.update({"title": title})
-    ctx.user_data.pop("state", None)
-    await update.message.reply_text(f"✅ Collection title updated to `{title}`", parse_mode=ParseMode.MARKDOWN)
-
-async def col_receive_delete_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    docs = db.collection(COL_COLLECTIONS).where("code", "==", code).limit(1).get()
-    if not docs:
-        await update.message.reply_text("❌ Collection not found.")
-    else:
-        docs[0].reference.update({"active": False})
-        await update.message.reply_text(f"✅ Collection `{code}` deleted.", parse_mode=ParseMode.MARKDOWN)
-    ctx.user_data.pop("state", None)
-
-async def col_receive_regen_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    docs = db.collection(COL_COLLECTIONS).where("code", "==", code).limit(1).get()
-    if not docs:
-        await update.message.reply_text("❌ Collection not found.")
-        ctx.user_data.pop("state", None)
-        return
-    new_code = generate_code()
-    while db.collection(COL_COLLECTIONS).where("code", "==", new_code).limit(1).get():
-        new_code = generate_code()
-    bot_info = await ctx.bot.get_me()
-    new_link = f"https://t.me/{bot_info.username}?start={new_code}"
-    docs[0].reference.update({"code": new_code, "link": new_link})
-    ctx.user_data.pop("state", None)
-    await update.message.reply_text(
-        f"🔄 *Link Regenerated!*\n\n🔑 New Code: `{new_code}`\n🔗 New Link:\n`{new_link}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-# ─── Collection Analytics ─────────────────────────────────────────────────────
-async def show_col_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    today = ts_today()
-    week  = ts_week()
-    month = ts_month()
-
-    cols = db.collection(COL_COLLECTIONS).where("active", "==", True).get()
-    total_cols  = len(cols)
-    total_views = sum(c.to_dict().get("views_total", 0) for c in cols)
-    today_views = sum(c.to_dict().get("views_daily", {}).get(today, 0) for c in cols)
-    week_views  = sum(c.to_dict().get("views_weekly", {}).get(week, 0) for c in cols)
-    month_views = sum(c.to_dict().get("views_monthly", {}).get(month, 0) for c in cols)
-
-    top = sorted(cols, key=lambda d: d.to_dict().get("views_total", 0), reverse=True)[:5]
-    top_text = ""
-    for i, c in enumerate(top, 1):
-        cd = c.to_dict()
-        top_text += f"\n  {i}. {cd.get('title','?')} — {cd.get('views_total',0)} views ({cd.get('file_count', len(cd.get('files',[])))}) files"
-
-    text = (
-        f"📈 *Collection Analytics*\n\n"
-        f"📦 Total Collections: `{total_cols}`\n"
-        f"👁 Views Today: `{today_views}`\n"
-        f"👁 Views This Week: `{week_views}`\n"
-        f"👁 Views This Month: `{month_views}`\n"
-        f"👁 Total Views: `{total_views}`\n\n"
-        f"🏆 Most Viewed:{top_text}"
-    )
-    kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm:back")]]
-    q = update.callback_query
-    if q:
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await (update.message or update.callback_query.message).reply_text(
-            text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN
-        )
-
 # ─── Callback Router ─────────────────────────────────────────────────────────
 async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     uid = update.effective_user.id
+
+    # ── Security: block non-admins from ALL admin callbacks ──────────────────
     if uid not in ADMIN_IDS:
-        await q.answer("⛔ Admins only.", show_alert=True)
+        await q.answer("⛔ Access denied.", show_alert=True)
         return
+
+    await q.answer()
     data = q.data
 
-    # ── Existing callbacks ──
+    # ── Pagination ────────────────────────────────────────────────────────────
+    if data.startswith("adm:page:"):
+        page = int(data.split(":")[-1])
+        await show_admin_menu(update, page=page)
+        return
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+    if data in ("adm:back", "adm:menu"):
+        await show_admin_menu(update, page=0)
+        return
+
+    # ── Info / Stats actions (reply below the panel message) ─────────────────
     if data == "adm:analytics":
         await cmd_analytics(update, ctx)
     elif data == "adm:users":
@@ -1070,92 +682,124 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_list_videos(update, ctx)
     elif data == "adm:maintenance":
         await cmd_maintenance(update, ctx)
-    elif data == "adm:back":
-        await show_admin_menu(update)
+
+    # ── State-driven actions (edit panel to prompt) ───────────────────────────
     elif data == "adm:upload":
-        await q.edit_message_text("📤 Send me the video/file to upload.")
+        await q.edit_message_text(
+            "📤 *Upload Video*\n\nSend me the video file to upload.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         ctx.user_data["state"] = AWAIT_VIDEO
     elif data == "adm:delete":
-        await q.edit_message_text("🗑 Send the video *code* to delete:", parse_mode=ParseMode.MARKDOWN)
+        await q.edit_message_text(
+            "🗑 *Delete Video*\n\nSend the video *code* to delete:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         ctx.user_data["state"] = AWAIT_DELETE_CODE
     elif data == "adm:edit_title":
-        await q.edit_message_text("✏️ Send the video *code* to edit title:", parse_mode=ParseMode.MARKDOWN)
+        await q.edit_message_text(
+            "✏️ *Edit Title*\n\nSend the video *code* to edit:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         ctx.user_data["state"] = AWAIT_EDIT_CODE
     elif data == "adm:gen_link":
-        await q.edit_message_text("🔗 Send the video *code* to get link:", parse_mode=ParseMode.MARKDOWN)
+        await q.edit_message_text(
+            "🔗 *Get Link*\n\nSend the video *code* to get its link:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         ctx.user_data["state"] = "gen_link"
     elif data == "adm:regen_link":
-        await q.edit_message_text("🔄 Send the video *code* to regenerate link:", parse_mode=ParseMode.MARKDOWN)
+        await q.edit_message_text(
+            "🔄 *Regenerate Link*\n\nSend the video *code* to regenerate link:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         ctx.user_data["state"] = "regen_link"
+    elif data == "adm:block":
+        await q.edit_message_text(
+            "🚫 *Block User*\n\nSend the user ID to block:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        ctx.user_data["state"] = AWAIT_BLOCK_ID
+    elif data == "adm:unblock":
+        await q.edit_message_text(
+            "✅ *Unblock User*\n\nSend the user ID to unblock:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        ctx.user_data["state"] = AWAIT_UNBLOCK_ID
+    elif data == "adm:broadcast":
+        await q.edit_message_text(
+            "📢 *Broadcast*\n\nSend me the content to broadcast.\nSupports: text, photo, video.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        ctx.user_data["state"] = AWAIT_BROADCAST_CONTENT
 
-    # ── Force Join callbacks ──
-    elif data == "adm:force_join_menu":
-        await show_force_join_menu(update, ctx)
-    elif data == "fj:toggle":
-        await fj_toggle(update, ctx)
-    elif data == "fj:set_channel":
-        await fj_set_channel_prompt(update, ctx)
-
-    # ── Collection callbacks ──
-    elif data == "adm:create_collection":
-        await collection_create_start(update, ctx)
-    elif data == "col:finalize":
-        await collection_finalize_prompt(update, ctx)
-    elif data == "adm:manage_collections":
-        await show_manage_collections(update, ctx)
-    elif data == "adm:col_analytics":
-        await show_col_analytics(update, ctx)
-    elif data == "col_mgr:edit":
-        await col_edit_prompt(update, ctx)
-    elif data == "col_mgr:delete":
-        await col_delete_prompt(update, ctx)
-    elif data == "col_mgr:regen":
-        await col_regen_prompt(update, ctx)
-
+    # ── Panel-triggered broadcast confirm/cancel ──────────────────────────────
+    elif data == "bc:cancel":
+        ctx.user_data.pop("bc_message_id", None)
+        ctx.user_data.pop("bc_chat_id", None)
+        ctx.user_data.pop("state", None)
+        await q.edit_message_text("❌ Broadcast cancelled.")
+    elif data == "bc:confirm":
+        state = ctx.user_data.get("state")
+        if state != AWAIT_BROADCAST_CONFIRM:
+            # Already handled by ConversationHandler — ignore
+            return
+        src_chat = ctx.user_data.pop("bc_chat_id", None)
+        src_msg  = ctx.user_data.pop("bc_message_id", None)
+        ctx.user_data.pop("state", None)
+        if not src_chat or not src_msg:
+            await q.edit_message_text("❌ Broadcast data lost. Please try again.")
+            return
+        users = db.collection(COL_USERS).where("blocked", "==", False).get()
+        total = len(users)
+        sent = failed = blocked_count = deactivated = 0
+        progress_msg = await q.edit_message_text(f"📢 Broadcasting to {total} users...\n\n⏳ Starting...")
+        start_time = time.time()
+        for i, u_doc in enumerate(users):
+            t_uid = int(u_doc.id)
+            try:
+                await ctx.bot.copy_message(chat_id=t_uid, from_chat_id=src_chat, message_id=src_msg)
+                sent += 1
+            except Forbidden:
+                blocked_count += 1
+                db.collection(COL_USERS).document(str(t_uid)).update({"blocked": True})
+            except BadRequest as e:
+                deactivated += 1 if "chat not found" in str(e).lower() else 0
+                failed += 0 if "chat not found" in str(e).lower() else 1
+            except TelegramError:
+                failed += 1
+            if (i + 1) % 50 == 0:
+                try:
+                    await progress_msg.edit_text(f"📢 Broadcasting... {i+1}/{total}\n✅ Sent: {sent} | ❌ Failed: {failed}")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+        elapsed = round(time.time() - start_time)
+        db.collection(COL_BROADCAST).add({
+            "sent": sent, "failed": failed, "blocked": blocked_count,
+            "deactivated": deactivated, "total": total,
+            "by": update.effective_user.id, "ts": SERVER_TIMESTAMP, "elapsed_sec": elapsed,
+        })
+        await progress_msg.edit_text(
+            f"📢 *Broadcast Complete!*\n\n"
+            f"👥 Total: `{total}`\n✅ Sent: `{sent}`\n"
+            f"🚫 Blocked: `{blocked_count}`\n💤 Deactivated: `{deactivated}`\n"
+            f"❌ Failed: `{failed}`\n⏱ Time: `{elapsed}s`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     else:
-        await show_admin_menu(update)
+        await show_admin_menu(update, page=0)
 
 # ─── Universal Message Handler (for button-triggered states) ──────────────────
 async def universal_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
+        # Silently ignore non-command messages from regular users
         return
     state = ctx.user_data.get("state")
     msg = update.message
 
-    # ── Collection file receiving (any file type, in collection mode) ──
-    if state == AWAIT_COLLECTION_FILES:
-        await collection_receive_file(update, ctx)
-        return
-
-    if state == AWAIT_COLLECTION_TITLE:
-        if not msg.text:
-            await msg.reply_text("❌ Please send a text title for the collection.")
-            return
-        await collection_receive_title(update, ctx)
-        return
-
-    # ── Force join channel input ──
-    if state == AWAIT_FORCE_JOIN_CHANNEL:
-        if msg.text:
-            await fj_receive_channel(update, ctx)
-        return
-
-    # ── Collection management states ──
-    if state == AWAIT_COL_EDIT_CODE:
-        await col_receive_edit_code(update, ctx)
-        return
-    if state == AWAIT_COL_EDIT_TITLE:
-        await col_receive_edit_title(update, ctx)
-        return
-    if state == AWAIT_COL_DELETE_CODE:
-        await col_receive_delete_code(update, ctx)
-        return
-    if state == AWAIT_COL_REGEN_CODE:
-        await col_receive_regen_code(update, ctx)
-        return
-
-    # ── Existing video/single upload (no state or AWAIT_VIDEO) ──
+    # Direct video upload (no state needed)
     if msg.video and not state:
         ctx.user_data["upload_file_id"] = msg.video.file_id
         ctx.user_data["upload_file_size"] = msg.video.file_size
@@ -1261,6 +905,52 @@ async def universal_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TY
             await msg.reply_text(f"🔄 New link:\n`{new_link}`", parse_mode=ParseMode.MARKDOWN)
         ctx.user_data.pop("state", None)
 
+    elif state == AWAIT_BLOCK_ID:
+        try:
+            target_uid = int(msg.text.strip() if msg.text else "")
+        except ValueError:
+            await msg.reply_text("❌ Invalid user ID.")
+            ctx.user_data.pop("state", None)
+            return
+        db.collection(COL_USERS).document(str(target_uid)).set({"blocked": True}, merge=True)
+        await msg.reply_text(f"✅ User `{target_uid}` has been blocked.", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data.pop("state", None)
+
+    elif state == AWAIT_UNBLOCK_ID:
+        try:
+            target_uid = int(msg.text.strip() if msg.text else "")
+        except ValueError:
+            await msg.reply_text("❌ Invalid user ID.")
+            ctx.user_data.pop("state", None)
+            return
+        db.collection(COL_USERS).document(str(target_uid)).set({"blocked": False}, merge=True)
+        await msg.reply_text(f"✅ User `{target_uid}` has been unblocked.", parse_mode=ParseMode.MARKDOWN)
+        ctx.user_data.pop("state", None)
+
+    elif state == AWAIT_BROADCAST_CONTENT:
+        # Triggered from admin panel — handle text, photo, or video
+        ctx.user_data["bc_message_id"] = msg.message_id
+        ctx.user_data["bc_chat_id"] = msg.chat_id
+        user_count = len(db.collection(COL_USERS).where("blocked", "==", False).get())
+        kb = [[
+            InlineKeyboardButton("✅ Send Now", callback_data="bc:confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="bc:cancel"),
+        ]]
+        await msg.reply_text(
+            f"📢 Ready to broadcast to *{user_count}* users.\n\nConfirm?",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        ctx.user_data["state"] = AWAIT_BROADCAST_CONFIRM
+
+    elif state == AWAIT_BROADCAST_CONFIRM:
+        # Waiting for callback — ignore text in this state
+        await msg.reply_text("⏳ Please tap a button above to confirm or cancel broadcast.")
+
+    elif state is None and msg.text:
+        # Admin typed plain text with no active state — show menu reminder
+        pass  # No action; admin may just be chatting
+
 # ─── Cancel ───────────────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
@@ -1354,10 +1044,11 @@ def build_app() -> Application:
     app.add_handler(broadcast_conv)
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(
-        filters.VIDEO | filters.Document.ALL | filters.PHOTO | filters.AUDIO |
-        (filters.TEXT & ~filters.COMMAND),
+        filters.VIDEO | (filters.TEXT & ~filters.COMMAND),
         universal_message_handler
     ))
+    # ── Unknown command handler — must be registered LAST ──────────────────────
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
     return app
 
